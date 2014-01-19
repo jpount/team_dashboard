@@ -1,0 +1,131 @@
+require 'xml'
+require 'open-uri'
+
+#
+# Configure the Ganglia URL and host in application.rb:
+#   config.ganglia_web_url  = ENV['GANGLIA_WEB_URL']
+#   config.ganglia_host     = ENV['GANGLIA_HOST']
+#
+# or use and environment variable:
+#   GANGLIA_WEB_URL=http://localhost:8080 rails s
+#
+# Target Selection:
+#   You need to know the cluster name, hostname and metric name. Usually its easy
+#   to obtain these from the graph url directly.
+#
+#   example: hostname@cluster(metric-name)
+#
+module Sources
+  module Datapoints
+    class Ganglia < Sources::Datapoints::Base
+
+      PORT = 8649
+
+      def initialize
+      end
+
+      def available?
+        available = false
+        if BackendSettings.secrets.use_ganglia_db?
+          available = !get_ganglia_web_url.blank? && !get_ganglia_host.blank?
+        else
+          available = BackendSettings.secrets.ganglia_url.present?
+        end
+        available
+      end
+
+      def get(options = {})
+        from    = (options[:from]).to_i
+        to      = (options[:to] || Time.now).to_i
+        widget  = Widget.find(options.fetch(:widget_id))
+        targets = targetsArray(widget.settings.fetch(:targets))
+        source  = options[:source]
+
+        targets = targets.reject(&:blank?)
+        ganglia_datapoints = request_datapoints(targets, from, to)
+        result = []
+        targets.each_with_index do |target, index|
+          result << { "target" => target, "datapoints" => ganglia_datapoints[index] }
+        end
+        raise Sources::Datapoints::NotFoundError if result.empty?
+        result
+      end
+
+      def available_targets(options = {})
+        pattern = options[:pattern] || ""
+        limit   = (options[:limit] || 200).to_i
+
+        cached_result = cached_get("ganglia") do
+          parse_targets(request_available_targets)
+        end
+
+        result = pattern.present? ? cached_result.reject { |target| target !~ /#{pattern}/ }  : cached_result
+        result.slice(0, limit)
+      end
+
+      def supports_target_browsing?
+        true
+      end
+
+      private
+
+      def url_builder
+        @url_builder ||= GangliaUrlBuilder.new(BackendSettings.secrets.ganglia_url)
+        if BackendSettings.secrets.use_ganglia_db?
+          @url_builder ||= GangliaUrlBuilder.new(get_ganglia_web_url)
+        else
+          @url_builder ||= GangliaUrlBuilder.new(BackendSettings.secrets.ganglia_url)
+        end
+      end
+
+      def parse_targets(xml)
+        targets = []
+        source = XML::Parser.string(xml)
+        content = source.parse
+        hosts = content.root.find('//CLUSTER/HOST')
+        cluster = content.root.find_first('//CLUSTER').attributes['NAME']
+        hosts.each do |host|
+          host.find('./METRIC').each do |metric|
+            targets << "#{host.attributes['NAME']}@#{cluster}(#{metric.attributes['NAME']})"
+          end
+        end
+        targets
+      end
+
+      def request_available_targets
+        Rails.logger.debug("Requesting available targets from #{BackendSettings.secrets.ganglia_host}:#{PORT} ...")
+        client = TCPSocket.open(BackendSettings.secrets.ganglia_host, PORT)
+        result = ""
+        while line = client.gets
+          result << line.chop
+        end
+        client.close
+        result
+      end
+
+      def request_datapoints(targets, from, to)
+        result = []
+        targets.each do |target|
+          hash = url_builder.datapoints_url(target, from, to)
+          Rails.logger.debug("Requesting datapoints from #{hash[:url]} with params #{hash[:params]} ...")
+          response = ::HttpService.request(hash[:url], :params => hash[:params])
+          if response == "null"
+            result << []
+          else
+            result << response.first["datapoints"]
+          end
+        end
+        result
+      end
+
+      def get_ganglia_web_url
+        web_url = !Conf.first.nil? ? Conf.first.ganglia_url : "localhost"
+      end
+
+      def get_ganglia_host
+        ganglia_host = !Conf.first.nil? ? Conf.first.ganglia_host : nil?
+      end
+
+    end
+  end
+end

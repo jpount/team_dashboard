@@ -1,0 +1,13 @@
+FactoryGirl.define do
+  factory :dashboard do
+    name 'Example Dashboard'
+  end
+
+  factory :widget do
+    name 'Example Widget'
+    kind 'number'
+    source 'demo'
+
+    association :dashboard
+  end
+end
